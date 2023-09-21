@@ -11,7 +11,11 @@ import java.util.zip.ZipInputStream
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.CharsetDecoder
+import org.springframework.web.bind.annotation.CrossOrigin
+import java.util.zip.ZipEntry
+import java.util.zip.ZipException
 
+@CrossOrigin(origins = ["http://localhost:3000"])
 @RestController
 class FileController {
 
@@ -22,6 +26,7 @@ class FileController {
     private var process: Process? = null
     private var outputReader: BufferedReader? = null
     private var inputWriter: BufferedWriter? = null
+    private var classFileAbsoluteDirectory: File? = null
 
     @PostMapping("/upload")
     fun uploadFile(@RequestParam("file") file: MultipartFile): ResponseEntity<String> {
@@ -34,36 +39,29 @@ class FileController {
 
         return try {
             val tempDir = Files.createTempDirectory("javaCode")
-            val zipPath = Paths.get(tempDir.toString(), "code.zip")
-            Files.write(zipPath, file.bytes)
+            val zipFilePath = Paths.get(tempDir.toString(), "code.zip")
+            Files.write(zipFilePath, file.bytes)
 
-            ZipInputStream(Files.newInputStream(zipPath)).use { zipInputStream ->
-                generateSequence { zipInputStream.nextEntry }.forEach { entry ->
-                    val outputFile = Paths.get(tempDir.toString(), entry.name)
-                    if (entry.isDirectory) {
-                        Files.createDirectories(outputFile)
-                    } else {
-                        Files.createDirectories(outputFile.parent)
-                        Files.newOutputStream(outputFile).use { fos ->
-                            zipInputStream.copyTo(fos)
-                        }
-                    }
-                }
+            // Unzip the file using Unix's built-in unzip command
+            val unzipDir = Paths.get(tempDir.toString(), "unzipDir")
+            Files.createDirectories(unzipDir)
+            val unzipProcess = ProcessBuilder("unzip", "-d", unzipDir.toString(), zipFilePath.toString())
+                .start()
+            unzipProcess.waitFor()
+
+            if (unzipProcess.exitValue() != 0) {
+                logger.info("Unzip failed: ${unzipProcess.inputStream.bufferedReader().readText()}")
+                return ResponseEntity.status(500).body("Unzip failed: ${unzipProcess.inputStream.bufferedReader().readText()}")
             }
 
             val charset: CharsetDecoder = Charset.forName("UTF-8").newDecoder()
-                .onMalformedInput(CodingErrorAction.IGNORE)  // Ignore malformed input
+                .onMalformedInput(CodingErrorAction.IGNORE)
 
-            val mainClassPath = findMainClass(tempDir, charset) ?: return ResponseEntity.status(500).body("Main class not found")
+            val mainClassPath = findMainClass(unzipDir, charset) ?: return ResponseEntity.status(500).body("Main class not found")
             logger.info("Main class found at: $mainClassPath")
 
-//            val mainClassName = mainClassPath
-//                .replace(".java", ".class")  // Replace .java extension with .class
-//                .replace("/", ".")  // Replace slashes with dots for class name
-//                .substringAfter("src/")
-
             val compileProcess = ProcessBuilder("javac", mainClassPath)
-                .directory(tempDir.toFile())
+                .directory(unzipDir.toFile())
                 .redirectErrorStream(true)
                 .start()
             compileProcess.waitFor()
@@ -73,38 +71,43 @@ class FileController {
                 return ResponseEntity.status(500).body("Compilation failed: ${compileProcess.inputStream.bufferedReader().readText()}")
             }
 
-//            val parentDir = tempDir.resolve("java_test").toFile()
             val classFileRelativeDirectory = Paths.get(mainClassPath).parent
-            val classFileAbsoluteDirectory = tempDir.resolve(classFileRelativeDirectory).toFile()
-            logger.info("Main class in classFileAbosoluteDirecotry: $classFileAbsoluteDirectory")
+            classFileAbsoluteDirectory = unzipDir.resolve(classFileRelativeDirectory).toFile()
 
-            process = ProcessBuilder("java", "Main")
-                .directory(classFileAbsoluteDirectory)
-                .redirectErrorStream(true)
-                .start()
-
-            logger.info("Java program started.")
-
-            outputReader = BufferedReader(InputStreamReader(process!!.inputStream))
-            inputWriter = BufferedWriter(OutputStreamWriter(process!!.outputStream))
-
-            val javaOutput = StringBuilder()
-            var line: String?
-            while (outputReader?.readLine().also { line = it } != null) {
-                javaOutput.append(line).append("\n")
-            }
-
-            if (process!!.waitFor() != 0) {
-                logger.info("Java program execution failed: $javaOutput file path: ${tempDir.toString()}")
-                return ResponseEntity.status(500).body("Java program execution failed: $javaOutput")
-            }
-
-            ResponseEntity.ok("File uploaded and Java program started. Output: $javaOutput")
-
+            ResponseEntity.ok("File uploaded successfully. Run the /run endpoint to execute the program.")
         } catch (e: Exception) {
             logger.error("An error occurred: ${e.message}")
             ResponseEntity.status(500).body("Failed to upload file: ${e.message}")
         }
+    }
+    @PostMapping("/run")
+    fun run(): ResponseEntity<String> {
+        logger.info("Java program starting.")
+
+        if (classFileAbsoluteDirectory == null) {
+            return ResponseEntity.status(500).body("No uploaded file found to run.")
+        }
+
+        process = ProcessBuilder("java", "Main")
+            .directory(classFileAbsoluteDirectory)
+            .redirectErrorStream(true)
+            .start()
+
+        outputReader = BufferedReader(InputStreamReader(process!!.inputStream))
+        inputWriter = BufferedWriter(OutputStreamWriter(process!!.outputStream))
+
+        val javaOutput = StringBuilder()
+        var line: String?
+        while (outputReader?.readLine().also { line = it } != null) {
+            javaOutput.append(line).append("\n")
+        }
+
+        if (process!!.waitFor() != 0) {
+            logger.info("Java program execution failed: $javaOutput")
+            return ResponseEntity.status(500).body("Java program execution failed: $javaOutput")
+        }
+
+        return ResponseEntity.ok("Java program started. Output: $javaOutput")
     }
 
     @PostMapping("/interact")
